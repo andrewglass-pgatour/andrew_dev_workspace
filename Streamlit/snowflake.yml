@@ -1,0 +1,18 @@
+definition_version: 2
+entities:
+  first_party_summary_dashboard:
+    type: streamlit
+    identifier:
+      name: PGAT_GOLDEN_RECORD_OVERVIEW
+      database: PGAT
+      schema: STREAMLIT_APPS
+    title: Marketing Data Insights
+    query_warehouse: STREAMLIT_APP_WH_XSMALL
+    runtime_name: SYSTEM$ST_CONTAINER_RUNTIME_PY3_11
+    compute_pool: STREAMLIT_POOL
+    external_access_integrations:
+      - PYPI_ACCESS_INTEGRATION
+    main_file: first_party_summary_dashboard.py
+    artifacts:
+      - first_party_summary_dashboard.py
+      - pyproject.toml
