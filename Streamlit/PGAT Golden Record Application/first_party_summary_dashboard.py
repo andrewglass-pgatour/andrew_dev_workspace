@@ -30,6 +30,8 @@ except Exception:
 WIT_RELATION = "ANALYTICS.PROD_WIT.WIT_ACTIVATIONS_SUMMARY"
 SAFARI_RELATION = "ANALYTICS.PROD_SAFARI.MOPS_SAFARI_SUMMARY"
 ACUITY_RELATION = "ANALYTICS.PROD_GOLDEN.UNIFIED_FAN_PROFILE_SOURCE_DISTRIBUTION"
+# Same view the TOUR Pass User Overview app reads, so Lava numbers match across both apps.
+LAVA_SUMMARY_RELATION = "ANALYTICS.PROD_TOUR_PASS.TOUR_PASS_LAVA_SUMMARY_STREAMLIT"
 
 # Page configuration
 st.set_page_config(
@@ -3134,6 +3136,140 @@ def show_audience_acuity_overlay():
     st.caption(f"📅 Data last refreshed: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')} | Source: `{relation}`")
 
 
+@st.cache_data(ttl=3600)  # Cache for 1 hour
+def get_lava_summary_data(_session, relation: str) -> pd.DataFrame:
+    """One-row Lava x TOUR Pass topline from the dbt model shared with the TOUR Pass app"""
+    df = _session.sql(f"select * from {relation}").to_pandas()
+    df.columns = df.columns.str.lower()
+    return df
+
+
+def _lava_pct(num, den) -> str:
+    if den is None or pd.isna(den) or float(den) == 0 or num is None or pd.isna(num):
+        return "N/A"
+    return f"{float(num) / float(den) * 100:.1f}%"
+
+
+def show_lava_redeemers():
+    """Display high-level Lava redemption metrics"""
+    st.header("🎟️ Lava Redeemers")
+
+    session = st.session_state.get('session')
+    if not session:
+        session = init_session()
+        if not session:
+            st.error("Unable to connect to Snowflake.")
+            return
+        st.session_state['session'] = session
+
+    try:
+        df = get_lava_summary_data(session, LAVA_SUMMARY_RELATION)
+    except Exception as e:
+        st.error(
+            f"Could not load `{LAVA_SUMMARY_RELATION}`: {e!s}. "
+            "Build dbt model `tour_pass_lava_summary_streamlit` and confirm this app's role can read it."
+        )
+        return
+
+    if df.empty:
+        st.warning("No rows in the Lava summary view.")
+        return
+
+    required = {"lava_redeemed_all", "tour_pass_redeemed", "tour_pass_members", "lava_redemptions_all", "tour_pass_redemptions"}
+    missing = required - set(df.columns)
+    if missing:
+        st.error(
+            f"`{LAVA_SUMMARY_RELATION}` is missing columns: {', '.join(sorted(missing))}. "
+            "Rebuild dbt model `tour_pass_lava_summary_streamlit`."
+        )
+        return
+
+    s = df.iloc[0]
+    total_redemptions = int(s["lava_redemptions_all"])
+    unique_redeemers = int(s["lava_redeemed_all"])
+    tp_redeemers = int(s["tour_pass_redeemed"])
+    tp_redemptions = int(s["tour_pass_redemptions"])
+    tp_members = int(s["tour_pass_members"])
+
+    st.caption(
+        "A redeemer is a Lava member with at least one active redemption of a non-test reward. "
+        "Test members and test rewards are excluded."
+    )
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Total Redemptions", f"{total_redemptions:,}")
+    with c2:
+        st.metric("Unique Redeemers", f"{unique_redeemers:,}")
+    with c3:
+        st.metric(
+            "Redemptions per Redeemer",
+            f"{total_redemptions / unique_redeemers:.2f}" if unique_redeemers else "N/A",
+        )
+
+    st.subheader("TOUR Pass Overlap")
+    c4, c5, c6, c7 = st.columns(4)
+    with c4:
+        st.metric(
+            "Redeemers Who Are TOUR Pass Members",
+            f"{tp_redeemers:,}",
+            help="Lava redeemers matched to a TOUR Pass (Gigya) account by email.",
+        )
+    with c5:
+        st.metric("% of Redeemers in TOUR Pass", _lava_pct(tp_redeemers, unique_redeemers))
+    with c6:
+        st.metric("% of TOUR Pass Members Who Redeemed", _lava_pct(tp_redeemers, tp_members))
+    with c7:
+        st.metric("TOUR Pass Member Redemptions", f"{tp_redemptions:,}")
+
+    breakdown = pd.DataFrame(
+        {
+            "Segment": ["TOUR Pass member redeemers", "Other redeemers (no TOUR Pass match)"],
+            "Redeemers": [tp_redeemers, max(unique_redeemers - tp_redeemers, 0)],
+        }
+    )
+    if _HAVE_ALTAIR:
+        st.altair_chart(
+            alt.Chart(breakdown)
+            .mark_bar(color="#E53935")
+            .encode(
+                x=alt.X("Redeemers:Q", title=None),
+                y=alt.Y("Segment:N", sort=None, title=None),
+                tooltip=[alt.Tooltip("Segment:N"), alt.Tooltip("Redeemers:Q", format=",")],
+            )
+            .properties(height=120),
+            use_container_width=True,
+        )
+    else:
+        st.bar_chart(breakdown.set_index("Segment")["Redeemers"], height=160)
+
+    # Trend from the daily first-party snapshot (only present once 'Lava Redeemers' has been loaded)
+    try:
+        trend = get_first_party_health_data(session)
+        trend.columns = trend.columns.str.lower()
+        trend = trend[trend["source"].astype(str).str.strip().str.lower() == "lava redeemers"].copy()
+        if not trend.empty:
+            trend["source_date"] = pd.to_datetime(trend["source_date"])
+            trend = (
+                trend.sort_values("source_date")
+                .drop_duplicates(subset=["source_date"], keep="last")
+                .set_index("source_date")[["record_count"]]
+                .rename(columns={"record_count": "Unique Redeemers"})
+            )
+            st.subheader("📈 Unique Redeemers Over Time")
+            st.line_chart(trend, height=320)
+    except Exception as e:
+        st.info(f"Redeemer trend unavailable: {e!s}")
+
+    st.caption(
+        f"{int(s['lava_members_without_email']):,} Lava members have no email (ticketing members) and can't be "
+        "matched to TOUR Pass, so TOUR Pass figures are a floor."
+        if "lava_members_without_email" in df.columns
+        else "Lava members without an email can't be matched to TOUR Pass, so TOUR Pass figures are a floor."
+    )
+    st.caption(f"Source: `{LAVA_SUMMARY_RELATION}` (same view as the TOUR Pass User Overview app)")
+
+
 def main():
     """Main application entry point"""
     st.title("📊 Marketing Data Insights Dashboard")
@@ -3151,6 +3287,7 @@ def main():
             "Wit Data",
             "Safari WiFi Data",
             "Fanatics Data",
+            "Lava Redeemers",
         ],
         index=0,
     )
@@ -3178,6 +3315,8 @@ def main():
         show_subscriber_information()
     elif page == "Fanatics Data":
         show_fanatics_data()
+    elif page == "Lava Redeemers":
+        show_lava_redeemers()
 
 if __name__ == "__main__":
     main()

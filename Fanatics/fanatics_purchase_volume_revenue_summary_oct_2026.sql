@@ -1,6 +1,6 @@
 /* ============================================================================
    FANATICS — PURCHASE VOLUME & REVENUE SUMMARY
-   Breakouts: by year, and by month_year.
+   Breakouts: by year, month_year, US vs. INTL, and INTL country.
    ----------------------------------------------------------------------------
    SOURCE: PGAT.FANATICS.PURCHASE_DATA (raw; one row = one order LINE).
    Same client_email-not-null filter as INT_PURCHASE_DATA.
@@ -17,7 +17,7 @@
                             shipping/tax) — the same definition as
                             ORDER_LINE_SPEND in INT_PURCHASE_DATA
      The two will not match: net total includes shipping/tax/discounts. Check
-     the reconciliation in §1c before quoting either.
+     the reconciliation in §1d before quoting either.
    ============================================================================ */
 
 
@@ -35,7 +35,10 @@ create or replace temporary table fanatics_lines as (
         r.order_net_total,
         r.order_ship_total,
         r.order_tax_total,
-        r.order_discount_total
+        r.order_discount_total,
+        r.ship_address_country,
+        r.ship_address_state,
+        r.ship_address_zip
     from PGAT.FANATICS.PURCHASE_DATA r
     where r.client_email is not null
 );
@@ -53,7 +56,10 @@ create or replace temporary table fanatics_orders as (
         max(order_net_total)                                as order_net_total,
         max(order_ship_total)                               as order_ship_total,
         max(order_tax_total)                                as order_tax_total,
-        max(order_discount_total)                           as order_discount_total
+        max(order_discount_total)                           as order_discount_total,
+        max(ship_address_country)                           as ship_address_country,
+        max(ship_address_state)                             as ship_address_state,
+        max(ship_address_zip)                                as ship_address_zip
     from fanatics_lines
     group by order_id
 );
@@ -81,7 +87,19 @@ from (
     having count(distinct order_net_total) > 1
 );
 
--- 1c. All-time totals — the reconciliation row for the two breakouts below.
+-- 1c. Shipping geography should be constant within each order.
+select
+    count(*)                                                as orders_with_conflicting_shipping_geography
+from (
+    select order_id
+    from fanatics_lines
+    group by order_id
+    having count(distinct nullif(upper(trim(ship_address_country)), '')) > 1
+        or count(distinct nullif(upper(trim(ship_address_state)), '')) > 1
+        or count(distinct nullif(trim(ship_address_zip), '')) > 1
+);
+
+-- 1d. All-time totals — the reconciliation row for the breakouts below.
 select
     count(*)                                                as orders,
     count(distinct client_email)                            as customers,
@@ -221,3 +239,119 @@ where s.client_email is null
    or abs(s.spend - m.model_spend) >= 0.01
 order by abs(coalesce(s.spend, 0) - coalesce(m.model_spend, 0)) desc
 limit 100;
+
+
+/* =================================== §5 ==================================
+   YEARLY REVENUE BY SHIPPING GEOGRAPHY
+   All breakouts use orders with a valid order date. US is classified from the
+   order's shipping country. Blank country values remain UNKNOWN rather than
+   being counted as INTL. International country values are shown as supplied
+   (uppercased/trimmed).
+   ========================================================================= */
+-- 5a. Annual US vs. INTL revenue; blank shipping country is UNKNOWN.
+with classified_orders as (
+    select
+        year(order_dt) as order_year,
+        case
+            when upper(trim(ship_address_country)) in
+                 ('US', 'USA', 'UNITED STATES', 'UNITED STATES OF AMERICA') then 'US'
+            when nullif(trim(ship_address_country), '') is null then 'UNKNOWN'
+            else 'INTL'
+        end as geography,
+        client_email,
+        line_items,
+        units,
+        line_revenue,
+        order_net_total
+    from fanatics_orders
+    where order_dt is not null
+),
+geography_rollup as (
+    select
+        order_year,
+        geography,
+        count(*) as orders,
+        count(distinct client_email) as customers,
+        sum(line_items) as line_items,
+        sum(units) as units,
+        sum(line_revenue) as line_revenue,
+        sum(order_net_total) as order_net_revenue
+    from classified_orders
+    group by order_year, geography
+),
+all_revenue as (
+    select
+        order_year,
+        sum(line_revenue) as total_line_revenue,
+        sum(order_net_total) as total_order_net_revenue
+    from classified_orders
+    group by order_year
+)
+select
+    g.order_year,
+    g.geography,
+    g.orders,
+    g.customers,
+    g.line_items,
+    g.units,
+    round(g.line_revenue, 2) as line_revenue_usd,
+    round(g.order_net_revenue, 2) as order_net_revenue_usd,
+    round(100.0 * g.line_revenue / nullif(a.total_line_revenue, 0), 1) as line_revenue_pct,
+    round(100.0 * g.order_net_revenue / nullif(a.total_order_net_revenue, 0), 1) as order_net_revenue_pct
+from geography_rollup g
+join all_revenue a on a.order_year = g.order_year
+order by g.order_year,
+         case g.geography when 'US' then 1 when 'INTL' then 2 else 3 end;
+
+-- 5b. Annual INTL revenue by shipping country. Country values are normalized
+--     for display only; no country-code/name mapping is applied.
+with intl_orders as (
+    select
+        year(order_dt) as order_year,
+        coalesce(nullif(upper(trim(ship_address_country)), ''), 'UNKNOWN') as country,
+        client_email,
+        line_items,
+        units,
+        line_revenue,
+        order_net_total
+    from fanatics_orders
+    where order_dt is not null
+      and upper(trim(ship_address_country)) not in
+          ('US', 'USA', 'UNITED STATES', 'UNITED STATES OF AMERICA')
+      and nullif(trim(ship_address_country), '') is not null
+),
+country_rollup as (
+    select
+        order_year,
+        country,
+        count(*) as orders,
+        count(distinct client_email) as customers,
+        sum(line_items) as line_items,
+        sum(units) as units,
+        sum(line_revenue) as line_revenue,
+        sum(order_net_total) as order_net_revenue
+    from intl_orders
+    group by order_year, country
+),
+intl_revenue as (
+    select
+        order_year,
+        sum(line_revenue) as total_line_revenue,
+        sum(order_net_total) as total_order_net_revenue
+    from intl_orders
+    group by order_year
+)
+select
+    c.order_year,
+    c.country,
+    c.orders,
+    c.customers,
+    c.line_items,
+    c.units,
+    round(c.line_revenue, 2) as line_revenue_usd,
+    round(c.order_net_revenue, 2) as order_net_revenue_usd,
+    round(100.0 * c.line_revenue / nullif(i.total_line_revenue, 0), 1) as intl_line_revenue_pct,
+    round(100.0 * c.order_net_revenue / nullif(i.total_order_net_revenue, 0), 1) as intl_order_net_revenue_pct
+from country_rollup c
+join intl_revenue i on i.order_year = c.order_year
+order by c.order_year, c.order_net_revenue desc;
